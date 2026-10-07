@@ -1,4 +1,4 @@
-#Requires AutoHotkey v2.0
+﻿#Requires AutoHotkey v2.0
 #SingleInstance Force
 
 ; Set custom hacker icon for the system tray
@@ -12,7 +12,7 @@ OnMessage(0x0404, AH_TrayIconInteraction)
 
 ; Tray menu entries (inserted above the standard items)
 A_TrayMenu.Insert("1&", "Show / Hide LeoType", (*) => ToggleUiVisibility())
-A_TrayMenu.Insert("2&", "Reset Position", (*) => RepositionPanel())
+A_TrayMenu.Insert("2&", "Reset Position", (*) => PlaceDefaultPosition())
 A_TrayMenu.Insert("3&")
 
 ; Prevent freezing and DPI issues
@@ -49,30 +49,24 @@ global LastCharWasTypo := false
 global ActiveBars := Map()      ; TargetHWnd -> BarObject
 
 ; -------------------------------------------------------------
-; 1. RATIO-BASED POSITIONING ENGINE WITH SAFE FALLBACK MECHANISM
+; 1. SAVED POSITION (fractions of the monitor's free space)
 ; -------------------------------------------------------------
-MonitorGetWorkArea(1, &Left, &Top, &Right, &Bottom)
-CurrentWidth := Right - Left
-CurrentHeight := Bottom - Top
+; PanelFracX/Y: 0 = left/top edge, 1 = right/bottom edge of the work area.
+; Using free space (screen minus panel size) guarantees the panel always fits.
+global PanelFracX := 1.0
+global PanelFracY := 1.0
+global PanelMon := MonitorGetPrimary()
+global HavePos := false
 
-StoredX := IniRead(IniFile, "Position", "RatioX", "ERROR")
-StoredY := IniRead(IniFile, "Position", "RatioY", "ERROR")
-
-if (StoredX == "ERROR" || StoredY == "ERROR" || StoredX == "" || StoredY == "") {
-    RatioX := 0.80
-    RatioY := 0.80
-} else {
-    RatioX := Float(StoredX)
-    RatioY := Float(StoredY)
-}
-
-SpawnX := Left + (RatioX * CurrentWidth)
-SpawnY := Top + (RatioY * CurrentHeight)
-
-; Force panel to be visible if it would be off-screen
-if (SpawnX < Left || SpawnX + PanelWidth > Right || SpawnY < Top || SpawnY + PanelHeight > Bottom) {
-    SpawnX := Right - PanelWidth - 15
-    SpawnY := Bottom - PanelHeight - 15
+try {
+    sx := IniRead(IniFile, "Position", "FracX", "")
+    sy := IniRead(IniFile, "Position", "FracY", "")
+    if (sx != "" && sy != "") {
+        PanelFracX := Float(sx)
+        PanelFracY := Float(sy)
+        PanelMon := Integer(IniRead(IniFile, "Position", "Monitor", String(MonitorGetPrimary())))
+        HavePos := true
+    }
 }
 
 ; -------------------------------------------------------------
@@ -119,7 +113,8 @@ ApplyLayout(false)
 
 ; Register custom low-level window message hooks
 OnMessage(0x0020, WM_SETCURSOR)
-OnMessage(0x0232, WM_EXITSIZEMOVE)   ; save position after every drag
+OnMessage(0x0232, WM_EXITSIZEMOVE)    ; save position after every drag
+OnMessage(0x007E, WM_DISPLAYCHANGE)   ; resolution / monitor change
 
 ; Global mouse hook for reliable click detection
 global MouseHook := DllCall("SetWindowsHookEx", "int", 14, "ptr", CallbackCreate(MouseProc, "C"), "ptr", 0, "uint", 0, "ptr")
@@ -127,40 +122,101 @@ global MouseHook := DllCall("SetWindowsHookEx", "int", 14, "ptr", CallbackCreate
 ; Runs on every exit path (panel X button, tray menu Exit, etc.)
 OnExit(CleanupOnExit)
 
-MainGui.Show("x" SpawnX " y" SpawnY " w" PanelWidth " h" PanelHeight " NoActivate")
+; Create hidden, place, then show (avoids a visible jump)
+MainGui.Show("Hide w" PanelWidth " h" PanelHeight)
+if HavePos
+    ApplyPanelPosition()
+else
+    PlaceDefaultPosition()
+MainGui.Show("NoActivate")
 
 ; -------------------------------------------------------------
-; 3. BACKGROUND TIMERS
+; 3. POSITION / RESOLUTION HANDLING
 ; -------------------------------------------------------------
-SetTimer(CheckResolutionChange, 1000)
+SetTimer(CheckResolutionChange, 500)
 SetTimer(SystemSyncEngine, 30)   ; toolbar docking / hover sync
 
-CheckResolutionChange() {
-    static LastWidth := 0, LastHeight := 0
-    MonitorGetWorkArea(1, &Left, &Top, &Right, &Bottom)
-    CurrentWidth := Right - Left
-    CurrentHeight := Bottom - Top
+Clamp(v, lo, hi) {
+    return Min(hi, Max(lo, v))
+}
 
-    ; First run only records the resolution (so the saved position isn't overridden at startup)
-    if (LastWidth == 0) {
-        LastWidth := CurrentWidth
-        LastHeight := CurrentHeight
-        return
+; Which monitor currently holds the centre of the panel
+GetPanelMonitor() {
+    MainGui.GetPos(&X, &Y, &W, &H)
+    cx := X + W // 2
+    cy := Y + H // 2
+    Loop MonitorGetCount() {
+        MonitorGetWorkArea(A_Index, &L, &T, &R, &B)
+        if (cx >= L && cx < R && cy >= T && cy < B)
+            return A_Index
     }
+    return MonitorGetPrimary()
+}
 
-    if (LastWidth != CurrentWidth || LastHeight != CurrentHeight) {
-        LastWidth := CurrentWidth
-        LastHeight := CurrentHeight
-        RepositionPanel()
+; Remember where the panel is, as fractions of the monitor's free space
+SavePositionRatios() {
+    global PanelFracX, PanelFracY, PanelMon, IniFile, HavePos
+    try {
+        MainGui.GetPos(&X, &Y, &W, &H)
+        Mon := GetPanelMonitor()
+        MonitorGetWorkArea(Mon, &L, &T, &R, &B)
+        FreeW := (R - L) - W
+        FreeH := (B - T) - H
+        PanelFracX := FreeW > 0 ? Clamp((X - L) / FreeW, 0, 1) : 0
+        PanelFracY := FreeH > 0 ? Clamp((Y - T) / FreeH, 0, 1) : 0
+        PanelMon := Mon
+        HavePos := true
+        IniWrite(String(PanelFracX), IniFile, "Position", "FracX")
+        IniWrite(String(PanelFracY), IniFile, "Position", "FracY")
+        IniWrite(String(PanelMon), IniFile, "Position", "Monitor")
     }
 }
 
-RepositionPanel() {
-    MonitorGetWorkArea(1, &Left, &Top, &Right, &Bottom)
-    SpawnX := Right - PanelWidth - 15
-    SpawnY := Bottom - PanelHeight - 15
-    MainGui.Move(SpawnX, SpawnY)
+; Move the panel to the remembered relative position on the current layout
+ApplyPanelPosition() {
+    global PanelFracX, PanelFracY, PanelMon
+    Mon := PanelMon
+    if (Mon < 1 || Mon > MonitorGetCount())
+        Mon := MonitorGetPrimary()
+
+    MonitorGetWorkArea(Mon, &L, &T, &R, &B)
+    MainGui.GetPos(, , &W, &H)
+    FreeW := Max(0, (R - L) - W)
+    FreeH := Max(0, (B - T) - H)
+    MainGui.Move(L + Round(PanelFracX * FreeW), T + Round(PanelFracY * FreeH))
+}
+
+; Bottom-right corner of the primary monitor (first launch / Reset Position)
+PlaceDefaultPosition() {
+    MonitorGetWorkArea(MonitorGetPrimary(), &L, &T, &R, &B)
+    MainGui.GetPos(, , &W, &H)
+    MainGui.Move(R - W - 15, B - H - 15)
     SavePositionRatios()
+}
+
+; Detect any change in monitor count or work-area size and re-apply the position
+CheckResolutionChange() {
+    static LastSig := ""
+    Sig := MonitorGetCount()
+    Loop MonitorGetCount() {
+        MonitorGetWorkArea(A_Index, &L, &T, &R, &B)
+        Sig .= "|" L "," T "," R "," B
+    }
+
+    if (LastSig == "") {
+        LastSig := Sig      ; first run: just record
+        return
+    }
+
+    if (Sig != LastSig) {
+        LastSig := Sig
+        ApplyPanelPosition()
+    }
+}
+
+; Windows tells us the display mode changed: re-check shortly after it settles
+WM_DISPLAYCHANGE(wParam, lParam, msg, hwnd) {
+    SetTimer(CheckResolutionChange, -300)
 }
 
 ; Show/hide the Inject Toolbar row and resize the panel to save space
@@ -195,8 +251,8 @@ ApplyLayout(Resize := true) {
 
     if Resize {
         MainGui.GetPos(&X, &Y)
-        MonitorGetWorkArea(1, &L, &T, &R, &B)
-        NewY := Max(T, Y + (OldHeight - PanelHeight))
+        MonitorGetWorkArea(GetPanelMonitor(), &L, &T, &R, &B)
+        NewY := Clamp(Y + (OldHeight - PanelHeight), T, B - PanelHeight)
         MainGui.Show("x" X " y" NewY " w" PanelWidth " h" PanelHeight " NoActivate")
         SavePositionRatios()
     }
@@ -339,8 +395,10 @@ MouseProc(nCode, wParam, lParam) {
                 return 1
             }
 
-            ; Allow dragging on background
-            PostMessage(0xA1, 2,,, MainGui.Hwnd)
+            ; Anywhere else on the panel: start dragging the window.
+            ; (WM_NCLBUTTONDOWN + HTCAPTION. The "ahk_id" prefix is required,
+            ; otherwise the handle is treated as a window title and nothing moves.)
+            PostMessage(0xA1, 2, 0, , "ahk_id " MainGui.Hwnd)
             return 1
         }
     }
@@ -396,7 +454,6 @@ AH_TrayIconInteraction(wParam, lParam, msg, hwnd) {
 
 ToggleUiVisibility() {
     if DllCall("user32\IsWindowVisible", "Ptr", MainGui.Hwnd) {
-        SavePositionRatios()
         MainGui.Hide()
     } else {
         MainGui.Show("NoActivate")
@@ -450,7 +507,9 @@ CompleteShutdown() {
     ExitApp()   ; CleanupOnExit does the rest
 }
 
-; Unhook the mouse, restore all toolbar-modified windows, save position
+; Unhook the mouse and restore all toolbar-modified windows.
+; (Position is saved after each drag, so it is not re-saved here: that could
+;  record a position Windows shifted during a resolution change.)
 CleanupOnExit(ExitReason, ExitCode) {
     global MouseHook, ActiveBars
     SetTimer(SystemSyncEngine, 0)
@@ -461,21 +520,6 @@ CleanupOnExit(ExitReason, ExitCode) {
         Keys.Push(hwnd)
     for hwnd in Keys
         RemoveToolbarInstance(hwnd)
-
-    SavePositionRatios()
-}
-
-SavePositionRatios() {
-    try {
-        MainGui.GetPos(&X, &Y)
-        MonitorGetWorkArea(1, &Left, &Top, &Right, &Bottom)
-        W := Right - Left
-        H := Bottom - Top
-        if (W > 0 && H > 0) {
-            IniWrite(String((X - Left) / W), IniFile, "Position", "RatioX")
-            IniWrite(String((Y - Top) / H), IniFile, "Position", "RatioY")
-        }
-    }
 }
 
 ; -------------------------------------------------------------
